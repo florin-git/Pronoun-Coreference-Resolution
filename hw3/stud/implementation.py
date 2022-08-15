@@ -123,7 +123,9 @@ class StudentModel(Model):
     # STUDENT: construct here your model
     # this class should be loading your weights and vocabulary
 
-    def predict(self, tokens: List[List[str]]) -> List[List[str]]:
+    def predict(
+        self, sentences: List[Dict]
+    ) -> List[Tuple[Tuple[str, int], Tuple[str, int]]]:
         # STUDENT: implement here your predict function
         # remember to respect the same order of tokens!
         pass

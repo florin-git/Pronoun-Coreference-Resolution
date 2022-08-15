@@ -1,7 +1,6 @@
 import os
 from transformers import (
     Trainer,
-    TrainingArguments,
     BertTokenizer,
     BertModel
 )
@@ -10,9 +9,11 @@ import numpy as np
 import pandas as pd
 
 import random
+import time
 import yaml
 from tqdm import tqdm
 from typing import *
+from arguments import CustomTrainingArguments
 
 import torch
 from torch import nn
@@ -45,33 +46,6 @@ df_valid = pd.read_csv(filepath_or_buffer=valid_clean_path, sep="\t")
 
 model_name_or_path = "bert-base-uncased"
 
-
-def get_class_label(is_coref_A: str, is_coref_B: str):
-    if is_coref_A == "TRUE" or is_coref_A is True:
-        return 0
-    elif is_coref_B == "TRUE" or is_coref_B is True:
-        return 1
-    else:
-        return 2
-
-
-FEMININE = 0
-MASCULINE = 1
-UNKNOWN = 2
-
-
-def get_gender(pronoun: str):
-    gender_mapping = {
-        'she': FEMININE,
-        'her': FEMININE,
-        'he': MASCULINE,
-        'his': MASCULINE,
-        'him': MASCULINE,
-    }
-
-    return gender_mapping.get(pronoun.lower(), UNKNOWN)
-
-
 FEMININE = 0
 MASCULINE = 1
 UNKNOWN = 2
@@ -98,33 +72,41 @@ class GAPDataset(Dataset):
         self.labeled = labeled
         self.tokenizer = tokenizer
         self.offsets, self.tokens = [], []
+#         self.original_offsets = []
 
         if labeled:
+            self._extract_target()
             self.labels = df.target.values.astype("uint8")
 
         self._convert_tokens_to_ids()
 
-#     @staticmethod
-#     def get_class_label(is_coref_A: str, is_coref_B: str):
-#         if is_coref_A == "TRUE":
-#                 return 0
-#         elif is_coref_B == "TRUE":
-#             return 1
-#         else:
-#             return 2
-
+    @staticmethod
+    def get_class_id(is_coref_A: Union[str, bool], is_coref_B: Union[str, bool]) -> int:
+        if is_coref_A == "TRUE" or is_coref_A is True:
+            return 0
+        elif is_coref_B == "TRUE" or is_coref_B is True:
+            return 1
+        else:
+            return 2
+        
+    def _extract_target(self):
+        self.df['target'] = [self.get_class_id(is_coref_A, is_coref_B) 
+                             for is_coref_A, is_coref_B in zip(self.df['is_coref_A'],  
+                                                               self.df['is_coref_B'])]
+        
     def _convert_tokens_to_ids(self):
         CLS = [self.tokenizer.cls_token]
         SEP = [self.tokenizer.sep_token]
 
         for _, row in self.df.iterrows():
             tokens, offsets = self._tokenize(row)
+#             self.original_offsets.append([row.offset_A, row.offset_B, row.p_offset])
             self.offsets.append(offsets)
             self.tokens.append(self.tokenizer.convert_tokens_to_ids(
                 CLS + tokens + SEP))
 
     def _tokenize(self, row):
-        # The order is important because we want that the pronoun comes after all the
+        # The order is important because we want the pronoun to come after all the
         # coreferenced entities in the output, even if B could come after the pronoun.
         break_points = sorted([
             ("A", row['offset_A'], row['entity_A']),
@@ -160,14 +142,8 @@ class GAPDataset(Dataset):
 
     def __getitem__(self, idx):
         if self.labeled:
-            return self.tokens[idx], self.offsets[idx], self.labels[idx]
+            return self.tokens[idx], self.offsets[idx], self.labels[idx] 
         return self.tokens[idx], self.offsets[idx], None
-
-
-df_train['target'] = [get_class_label(is_coref_A, is_coref_B) for is_coref_A, is_coref_B in zip(
-    df_train['is_coref_A'],  df_train['is_coref_B'])]
-df_valid['target'] = [get_class_label(is_coref_A, is_coref_B) for is_coref_A, is_coref_B in zip(
-    df_valid['is_coref_A'],  df_valid['is_coref_B'])]
 
 tokenizer = BertTokenizer.from_pretrained(model_name_or_path)
 train_ds = GAPDataset(df_train, tokenizer)
@@ -210,42 +186,6 @@ def collate_batch(batch, truncate_len=400):
     return features_tensor, offsets_tensor, labels_tensor
 
 
-def retrieve_entities_and_pron_embeddings(bert_embeddings, entities_and_pron_offsets):
-    embeddings_A = []
-    embeddings_B = []
-    embeddings_pron = []
-
-    # Consider embeddings and offsets in each batch separately
-    for embeddings, off in zip(bert_embeddings, entities_and_pron_offsets):
-        # The offsets of mention A are the first and the second
-        # in the 'off' tensor
-        offsets_ent_A = range(off[0], off[1]+1)
-        # The offsets of mention B are the third and the fourth
-        # in the 'off' tensor
-        offsets_ent_B = range(off[2], off[3]+1)
-        # The offset of the pronoun is the last in the 'off' tensor
-        offset_pron = off[-1]
-
-        # The embedding of a mention is the mean of
-        # all the subtokens embeddings that represent it
-        embeddings_A.append(embeddings[offsets_ent_A].mean(dim=0))
-        embeddings_B.append(embeddings[offsets_ent_B].mean(dim=0))
-        embeddings_pron.append(embeddings[offset_pron])
-
-    # Merge outputs
-    merged_entities_and_pron_embeddings = torch.cat([
-        torch.stack(embeddings_A, dim=0),
-        torch.stack(embeddings_B, dim=0),
-        torch.stack(embeddings_pron, dim=0)
-    ], dim=1)
-    # print(torch.stack(outputs_A, dim=0))
-    # torch.stack(outputs_B, dim=0)
-    # print(torch.stack(outputs_pron, dim=0))
-
-    # shape: batch_size x (embedding_dim * 3)
-    return merged_entities_and_pron_embeddings
-
-
 class CorefHead(nn.Module):
     def __init__(self, bert_hidden_size: int):
         super().__init__()
@@ -258,6 +198,15 @@ class CorefHead(nn.Module):
 #             nn.ReLU(),
 #             nn.Linear(512, 3)
 #         )
+
+        # a) Always BN -> AC, (Nothing b/w them).
+        # b) BN -> Dropout over Dropout -> BN, but try both. [Newer research, finds 1st better ]
+        # c) BN eliminates the need of Dropout, no need to use Dropout.
+        # e) BN before Dropout is data Leakage.
+        # f) Best thing is to try every combination.
+        # SO CALLED BEST METHOD -
+        # Layer -> BN -> AC -> Dropout ->Layer
+        
         self.fc = nn.Sequential(
             #             nn.BatchNorm1d(bert_hidden_size * 3),
             #             nn.Dropout(0.5),
@@ -278,10 +227,45 @@ class CorefHead(nn.Module):
 
     def forward(self, bert_outputs, offsets):
         assert bert_outputs.shape[2] == self.bert_hidden_size
-        embeddings = retrieve_entities_and_pron_embeddings(bert_outputs,
+        embeddings = self._retrieve_entities_and_pron_embeddings(bert_outputs,
                                                            offsets)
 
         return self.fc(embeddings)
+    
+    def _retrieve_entities_and_pron_embeddings(self, bert_embeddings, entities_and_pron_offsets):
+        embeddings_A = []
+        embeddings_B = []
+        embeddings_pron = []
+
+        # Consider embeddings and offsets in each batch separately
+        for embeddings, off in zip(bert_embeddings, entities_and_pron_offsets):
+            # The offsets of mention A are the first and the second
+            # in the 'off' tensor
+            offsets_ent_A = range(off[0], off[1]+1)
+            # The offsets of mention B are the third and the fourth
+            # in the 'off' tensor
+            offsets_ent_B = range(off[2], off[3]+1)
+            # The offset of the pronoun is the last in the 'off' tensor
+            offset_pron = off[-1]
+
+            # The embedding of a mention is the mean of
+            # all the subtokens embeddings that represent it
+            embeddings_A.append(embeddings[offsets_ent_A].mean(dim=0))
+            embeddings_B.append(embeddings[offsets_ent_B].mean(dim=0))
+            embeddings_pron.append(embeddings[offset_pron])
+
+        # Merge outputs
+        merged_entities_and_pron_embeddings = torch.cat([
+            torch.stack(embeddings_A, dim=0),
+            torch.stack(embeddings_B, dim=0),
+            torch.stack(embeddings_pron, dim=0)
+        ], dim=1)
+        # print(torch.stack(outputs_A, dim=0))
+        # torch.stack(outputs_B, dim=0)
+        # print(torch.stack(outputs_pron, dim=0))
+
+        # shape: batch_size x (embedding_dim * 3)
+        return merged_entities_and_pron_embeddings
 
 
 class GAPModel(nn.Module):
@@ -290,9 +274,9 @@ class GAPModel(nn.Module):
     def __init__(self, bert_model: str):
         super().__init__()
 
-        if bert_model in ("bert-base-uncased", "bert-base-cased"):
+        if bert_model in {"bert-base-uncased", "bert-base-cased"}:
             self.bert_hidden_size = 768
-        elif bert_model in ("bert-large-uncased", "bert-large-cased"):
+        elif bert_model in {"bert-large-uncased", "bert-large-cased"}:
             self.bert_hidden_size = 1024
         else:
             raise ValueError("Unsupported BERT model.")
@@ -318,7 +302,7 @@ class Trainer:
     def __init__(
         self,
         model: nn.Module,
-        args: TrainingArguments,
+        args: CustomTrainingArguments,
         train_dataloader: DataLoader,
         valid_dataloader: DataLoader,
         criterion: torch.nn,
@@ -337,97 +321,120 @@ class Trainer:
         if args is None:
             output_dir = "../../model/tmp_trainer"
             print(f"No 'TrainingArguments' passed, using 'output_dir={output_dir}'.")
-            args = TrainingArguments(output_dir=output_dir)
+            args = CustomTrainingArguments(output_dir=output_dir)
         
         self.args = args
         
-    def train(self, grad_clipping):
+    def train(self):
         args = self.args
-        train_dataloader = self.train_dataloader
         valid_dataloader = self.valid_dataloader
+        epochs = args.num_train_epochs
         
         train_losses = []
         train_acc_list = []
         valid_losses = []
         valid_acc_list = []
         
-        epochs = args.num_train_epochs
-        train_loss = 0.0
-        train_acc, total_count = 0.0, 0.0
-        
-        scaler = GradScaler()
-        self.model.train()
-        for epoch in range(epochs):
-            
-            epoch_loss = 0.0
-            
-            for step, (features, offsets, labels) in enumerate(train_dataloader):
-                # Empty gradients
-                self.optimizer.zero_grad(set_to_none=True)
-                
-                # Forward
-                predictions = self.model(features, offsets)
-                
-                
-                
-                loss = self.criterion(predictions, labels)
-                train_acc += (predictions.argmax(1) == labels).sum().item()
-                total_count += labels.shape[0]
-                
-#                 # Backward  
-#                 loss.backward()
-                # Backward pass without mixed precision
-                # It's not recommended to use mixed precision for backward pass
-                # Because we need more precise loss
-                scaler.scale(loss).backward()
-                
-                torch.nn.utils.clip_grad_norm_(self.model.parameters(), grad_clipping)
-                
-                # Update weights 
-#                 self.optimizer.step()
-                scaler.step(self.optimizer)
-                scaler.update()
-        
-                
-                epoch_loss += loss.tolist()
+        if args.early_stopping:
+            patience_counter = 0 
 
-                if step % args.logging_steps == args.logging_steps - 1:
-                    mid_loss = epoch_loss / (step + 1)
-                    mid_acc = train_acc / total_count
-#                     print('\t[E: {:2d} @ step {}] current avg loss = {:0.4f}'.format(epoch, step, mid_loss))
-                    print(f'\t| step {step+1:3d}/{len(train_dataloader):d} | train_loss: {mid_loss:.3f} | ' \
-                    f'train_acc: {mid_acc:.3f} |')
-            
-            avg_epoch_loss = epoch_loss / len(train_dataloader)
-            train_loss += avg_epoch_loss
+        scaler = GradScaler()
+
+        if args.resume_from_checkpoint is not None:
+            self._resume_model(args.resume_from_checkpoint, scaler)
+
+        training_start_time = time.time()
+        print("\nTraining...")
+        for epoch in range(epochs):
+            train_loss, train_acc = self._inner_training_loop(scaler)
             train_losses.append(train_loss)
-            train_acc_list.append(train_acc / total_count)
-            
-#             print('\t[E: {:2d}] train loss = {:0.4f}'.format(epoch, avg_epoch_loss))  # print train loss at the end of the epoch
-            
-    
+            train_acc_list.append(train_acc)
+
             valid_loss, valid_acc = self.evaluate(valid_dataloader)
             valid_losses.append(valid_loss)
             valid_acc_list.append(valid_acc)
-            
-#             print('  [E: {:2d}] valid loss = {:0.4f}'.format(epoch, valid_loss))
-            print('-' * 75)
-            print(f'| epoch {epoch+1:3d}/{epochs:d} | train_loss: {avg_epoch_loss:.3f} | ' \
-                    f'valid_loss: {valid_loss:.3f} | valid_acc: {valid_acc:.3f} |')
-            print('-' * 75)
-            
-        avg_epoch_loss = train_loss / epochs
-        histories = {
+
+            if self.scheduler is not None:
+                print('-' * 14)
+                print(f"  LR: {self.scheduler.get_last_lr()[0]:.2e}")
+                self.scheduler.step()
+
+            self._print_epoch_log(epoch, epochs, train_loss, valid_loss, valid_acc)
+
+            if args.early_stopping and len(valid_acc_list) >= 2:
+                # stop = args.early_stopping_mode == 'min' and epoch > 0 and valid_acc_list[-1] > valid_acc_list[-2]
+                stop = args.early_stopping_mode == 'max' and epoch > 0 and valid_acc_list[-1] < valid_acc_list[-2]
+                if stop:
+                    if patience_counter >= args.early_stopping_patience:
+                        print('Early stop.')
+                        break
+                    else:
+                        print('-- Patience.\n')
+                        patience_counter += 1
+        
+        training_time = time.time() - training_start_time
+        print(f'Training time: {training_time:.2f}s')
+
+        metrics_history = {
             "train_losses": train_losses,
             "train_acc": train_acc_list,
             "valid_losses": valid_losses,
             "valid_acc": valid_acc_list,
-
         }
-#         print(histories)
+        print(metrics_history)
+        if args.save_model:
+            self._save_model(epoch, valid_acc, scaler)
+    
+        return #metrics_history
+
+    def _inner_training_loop(self, scaler):
+        args = self.args
+        train_dataloader = self.train_dataloader
         
-        return #avg_epoch_loss, histories
+        train_loss = 0.0
+        train_acc, total_count = 0.0, 0.0
+
+        self.model.train()
+        for step, (features, offsets, labels) in enumerate(train_dataloader):
+            # Empty gradients
+            self.optimizer.zero_grad(set_to_none=True)
             
+            # Forward
+            predictions = self.model(features, offsets)
+            loss = self.criterion(predictions, labels)
+            # with torch.cuda.amp.autocast(): # autocast as a context manager
+            #     predictions = self.model(features, offsets)
+            #     loss = self.criterion(predictions, labels)
+
+            train_acc += (predictions.argmax(1) == labels).sum().item()
+            total_count += labels.shape[0]
+            
+#                 # Backward  
+            # loss.backward()
+            # Backward pass without mixed precision
+            # It's not recommended to use mixed precision for backward pass
+            # Because we need more precise loss
+            scaler.scale(loss).backward()
+            
+            if args.grad_clipping is not None:
+                scaler.unscale_(optimizer)
+                torch.nn.utils.clip_grad_norm_(self.model.parameters(), args.grad_clipping)
+            
+            # Update weights 
+            # self.optimizer.step()
+            scaler.step(self.optimizer)
+            scaler.update()
+
+            train_loss += loss.item()
+
+            if step % args.logging_steps == args.logging_steps - 1:
+                running_loss = train_loss / (step + 1)
+                running_acc = train_acc / total_count
+                self._print_step_log(step, running_loss, running_acc)
+                
+        return train_loss / len(train_dataloader), train_acc / total_count
+
+
     def evaluate(self, eval_dataloader):
         valid_loss = 0.0
         eval_acc, total_count = 0, 0
@@ -438,7 +445,7 @@ class Trainer:
                 
                 predictions = self.model(features, offsets)
                 loss = self.criterion(predictions, labels)
-                valid_loss += loss.tolist()
+                valid_loss += loss.item()
 
                 eval_acc += (predictions.argmax(1) == labels).sum().item()
                 total_count += labels.shape[0]
@@ -446,12 +453,42 @@ class Trainer:
         return valid_loss / len(eval_dataloader), eval_acc / total_count
 
 
+    def _print_step_log(self, step, running_loss, running_acc):
+        print(f'\t| step {step+1:3d}/{len(self.train_dataloader):d} | train_loss: {running_loss:.3f} | ' \
+                f'train_acc: {running_acc:.3f} |')
+
+    def _print_epoch_log(self, epoch, epochs, train_loss, valid_loss, valid_acc):
+        print('-' * 74)
+        print(f'| epoch {epoch+1:3d}/{epochs:d} | train_loss: {train_loss:.3f} | ' \
+                f'valid_loss: {valid_loss:.3f} | valid_acc: {valid_acc:.3f} |')
+        print('-' * 74)
+        
+    
+    def _save_model(self, epoch, valid_acc, scaler):
+        print("Saving model...")
+        torch.save({
+                "epoch": epoch,
+                "model_state_dict": self.model.state_dict(),
+                "optimizer_state_dict": self.optimizer.state_dict(),
+                "scaler_state_dict": scaler.state_dict(),
+            }, f"{self.args.output_dir}my_model_{str(valid_acc)[2:5]}_{epoch+1}.pth")
+        print("Model saved.")
+
+    def _resume_model(self, path, scaler):
+        checkpoint = torch.load(path, map_location=device)
+        self.model.load_state_dict(checkpoint['model_state_dict'])
+        self.optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
+        scaler.load_state_dict(checkpoint['scaler_state_dict'])
+
+
+
+
 yaml_file = "./train.yaml"
 # Read configuration file with all the necessary parameters
 with open(yaml_file) as file:
     config = yaml.safe_load(file)
     
-training_args = TrainingArguments(**config['training_args'])
+training_args = CustomTrainingArguments(**config['training_args'])
 
 # Make sure that the learning rate is read as a number and not as a string
 training_args.learning_rate = float(training_args.learning_rate)
@@ -460,19 +497,19 @@ model = GAPModel(model_name_or_path).to(device, non_blocking=True)
 
 criterion = torch.nn.CrossEntropyLoss().to(device=device, non_blocking=True)
 optimizer = torch.optim.Adam(model.parameters(), lr=training_args.learning_rate)
+scheduler = torch.optim.lr_scheduler.StepLR(optimizer, step_size=5, gamma=0.1)
 
 batch_size = 4
 
 train_dataloader = DataLoader(train_ds, batch_size=batch_size, 
-                              collate_fn=collate_batch, shuffle=True)
+                            collate_fn=collate_batch, shuffle=True)
+                            
 valid_dataloader = DataLoader(valid_ds, batch_size=batch_size, 
-                              collate_fn=collate_batch, shuffle=False)
+                            collate_fn=collate_batch, shuffle=False)
 
 trainer = Trainer(model, training_args, 
-                  train_dataloader, valid_dataloader, 
-                  criterion, optimizer)
+                train_dataloader, valid_dataloader, 
+                criterion, optimizer, scheduler)
 
 
-grad_clipping = 0.7
-
-trainer.train(grad_clipping)
+trainer.train()
