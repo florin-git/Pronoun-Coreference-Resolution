@@ -26,20 +26,19 @@ training_args:
   # logging_steps: 250
   # logging_dir: log
   # learning_rate: 0.000005
-  # gradient_accumulation_steps: 1 # batch size * acc = 8 
+  # gradient_accumulation_steps: 1 # batch size * acc = 8
   # fp16: True
   # seed: 10
-  # dataloader_num_workers: 0 
+  # dataloader_num_workers: 0
 
   output_dir: ../../model/checkpoints/
   save_model: False
   # resume_from_checkpoint: ../../model/checkpoints/850_6.pth
-  num_train_epochs: 10
-  logging_steps: 10
+  num_train_epochs: 4
+  logging_steps: 250
   # learning_rate: 0.000005
-  learning_rate: 0.004545
+  learning_rate: 0.000005
   # grad_clipping: None
-
-
-  
-  # full_determinism: True # For reproducibility
+  early_stopping: True
+  early_stopping_mode: max
+  early_stopping_patience: 2

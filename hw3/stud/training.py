@@ -44,7 +44,7 @@ df_train = pd.read_csv(filepath_or_buffer=train_clean_path, sep="\t")
 df_valid = pd.read_csv(filepath_or_buffer=valid_clean_path, sep="\t")
 
 
-model_name_or_path = "bert-base-uncased"
+model_name_or_path = "bert-base-cased"
 
 FEMININE = 0
 MASCULINE = 1
@@ -218,10 +218,14 @@ class CorefHead(nn.Module):
             #             nn.ReLU(),
             #             nn.BatchNorm1d(self.head_hidden_size),
             #             nn.Dropout(0.5),
-            nn.Dropout(0.1),
             nn.Linear(bert_hidden_size * 3, self.head_hidden_size),
             nn.BatchNorm1d(self.head_hidden_size),
             nn.LeakyReLU(),
+            nn.Dropout(0.5),
+            nn.Linear(self.head_hidden_size, self.head_hidden_size),
+            nn.BatchNorm1d(self.head_hidden_size),
+            nn.LeakyReLU(),
+            nn.Dropout(0.1),
             nn.Linear(self.head_hidden_size, 3)
         )
 
@@ -292,8 +296,10 @@ class GAPModel(nn.Module):
             token_type_ids=None, output_hidden_states=True)
 #         concat_bert = torch.cat((bert_outputs[-1],bert_outputs[-2],bert_outputs[-3]),dim=-1)
 
-        last_layer = bert_outputs.last_hidden_state
-        head_outputs = self.head(last_layer, offsets)
+        # last_layer = bert_outputs.last_hidden_state
+        layers_to_sum = torch.stack([bert_outputs.hidden_states[x] for x in [-1, -2, -3, -4]], axis=0)
+        bert_sum = torch.sum(layers_to_sum, axis=0)
+        head_outputs = self.head(bert_sum, offsets)
 #         return concat_bert
         return head_outputs
 
@@ -355,8 +361,8 @@ class Trainer:
             valid_acc_list.append(valid_acc)
 
             if self.scheduler is not None:
-                print('-' * 14)
-                print(f"  LR: {self.scheduler.get_last_lr()[0]:.2e}")
+                print('-' * 17)
+                print(f"| LR: {self.scheduler.get_last_lr()[0]:.3e} |")
                 self.scheduler.step()
 
             self._print_epoch_log(epoch, epochs, train_loss, valid_loss, valid_acc)
@@ -383,7 +389,7 @@ class Trainer:
         }
         print(metrics_history)
         if args.save_model:
-            self._save_model(epoch, valid_acc, scaler)
+            self._save_model(epoch, valid_acc, scaler, metrics_history)
     
         return #metrics_history
 
@@ -392,7 +398,7 @@ class Trainer:
         train_dataloader = self.train_dataloader
         
         train_loss = 0.0
-        train_acc, total_count = 0.0, 0.0
+        train_correct, total_count = 0.0, 0.0
 
         self.model.train()
         for step, (features, offsets, labels) in enumerate(train_dataloader):
@@ -400,16 +406,16 @@ class Trainer:
             self.optimizer.zero_grad(set_to_none=True)
             
             # Forward
-            predictions = self.model(features, offsets)
-            loss = self.criterion(predictions, labels)
-            # with torch.cuda.amp.autocast(): # autocast as a context manager
-            #     predictions = self.model(features, offsets)
-            #     loss = self.criterion(predictions, labels)
+            # predictions = self.model(features, offsets)
+            # loss = self.criterion(predictions, labels)
+            with torch.cuda.amp.autocast(): # autocast as a context manager
+                predictions = self.model(features, offsets)
+                loss = self.criterion(predictions, labels)
 
-            train_acc += (predictions.argmax(1) == labels).sum().item()
+            train_correct += (predictions.argmax(1) == labels).sum().item()
             total_count += labels.shape[0]
             
-#                 # Backward  
+            # Backward  
             # loss.backward()
             # Backward pass without mixed precision
             # It's not recommended to use mixed precision for backward pass
@@ -429,15 +435,15 @@ class Trainer:
 
             if step % args.logging_steps == args.logging_steps - 1:
                 running_loss = train_loss / (step + 1)
-                running_acc = train_acc / total_count
+                running_acc = train_correct / total_count
                 self._print_step_log(step, running_loss, running_acc)
                 
-        return train_loss / len(train_dataloader), train_acc / total_count
+        return train_loss / len(train_dataloader), train_correct / total_count
 
 
     def evaluate(self, eval_dataloader):
         valid_loss = 0.0
-        eval_acc, total_count = 0, 0
+        eval_correct, total_count = 0, 0
         
         self.model.eval()
         with torch.no_grad():
@@ -447,10 +453,10 @@ class Trainer:
                 loss = self.criterion(predictions, labels)
                 valid_loss += loss.item()
 
-                eval_acc += (predictions.argmax(1) == labels).sum().item()
+                eval_correct += (predictions.argmax(1) == labels).sum().item()
                 total_count += labels.shape[0]
         
-        return valid_loss / len(eval_dataloader), eval_acc / total_count
+        return valid_loss / len(eval_dataloader), eval_correct / total_count
 
 
     def _print_step_log(self, step, running_loss, running_acc):
@@ -458,20 +464,32 @@ class Trainer:
                 f'train_acc: {running_acc:.3f} |')
 
     def _print_epoch_log(self, epoch, epochs, train_loss, valid_loss, valid_acc):
-        print('-' * 74)
-        print(f'| epoch {epoch+1:3d}/{epochs:d} | train_loss: {train_loss:.3f} | ' \
+        print('-' * 76)
+        print(f'| epoch {epoch+1:>3d}/{epochs:<3d} | train_loss: {train_loss:.3f} | ' \
                 f'valid_loss: {valid_loss:.3f} | valid_acc: {valid_acc:.3f} |')
-        print('-' * 74)
+        print('-' * 76)
         
     
-    def _save_model(self, epoch, valid_acc, scaler):
+    def _save_model(self, epoch, valid_acc, scaler, metrics_history):
         print("Saving model...")
-        torch.save({
-                "epoch": epoch,
-                "model_state_dict": self.model.state_dict(),
-                "optimizer_state_dict": self.optimizer.state_dict(),
-                "scaler_state_dict": scaler.state_dict(),
-            }, f"{self.args.output_dir}my_model_{str(valid_acc)[2:5]}_{epoch+1}.pth")
+        if self.scheduler is None:
+            torch.save({
+                    "epoch": epoch,
+                    "model_state_dict": self.model.state_dict(),
+                    "optimizer_state_dict": self.optimizer.state_dict(),
+                    "scaler_state_dict": scaler.state_dict(),
+                    "metrics_history": metrics_history,
+                }, f"{self.args.output_dir}my_model_{str(valid_acc)[2:5]}_{epoch+1}.pth")
+        else:
+            torch.save({
+                    "epoch": epoch,
+                    "model_state_dict": self.model.state_dict(),
+                    "optimizer_state_dict": self.optimizer.state_dict(),
+                    "scheduler_state_dict": self.scheduler.state_dict(),
+                    "scaler_state_dict": scaler.state_dict(),
+                    "metrics_history": metrics_history,
+                }, f"{self.args.output_dir}my_model_{str(valid_acc)[2:5]}_{epoch+1}.pth")
+
         print("Model saved.")
 
     def _resume_model(self, path, scaler):
@@ -495,9 +513,19 @@ training_args.learning_rate = float(training_args.learning_rate)
 
 model = GAPModel(model_name_or_path).to(device, non_blocking=True)
 
+# modules = [model.bert.embeddings, *model.bert.encoder.layer[-4:]]
+# for module in modules:
+#     for param in module.parameters():
+#         param.requires_grad = False
+
 criterion = torch.nn.CrossEntropyLoss().to(device=device, non_blocking=True)
 optimizer = torch.optim.Adam(model.parameters(), lr=training_args.learning_rate)
-scheduler = torch.optim.lr_scheduler.StepLR(optimizer, step_size=5, gamma=0.1)
+# optimizer = torch.optim.AdamW(model.parameters(), lr=training_args.learning_rate)
+# optimizer = torch.optim.SGD(model.parameters(), lr=training_args.learning_rate, momentum=0.9)
+scheduler = torch.optim.lr_scheduler.StepLR(optimizer, step_size=2, gamma=0.5)
+# scheduler = torch.optim.lr_scheduler.MultiStepLR(optimizer, milestones=[3, 5], gamma=0.5)
+# scheduler = torch.optim.lr_scheduler.CyclicLR(optimizer, base_lr=training_args.learning_rate, max_lr=0.0001)
+# scheduler = None
 
 batch_size = 4
 
