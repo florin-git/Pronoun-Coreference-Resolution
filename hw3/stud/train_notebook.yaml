@@ -32,12 +32,12 @@ training_args:
   # dataloader_num_workers: 0
 
   output_dir: ../../model/checkpoints/
-  save_model: True
+  save_model: False
   # resume_from_checkpoint: ../../model/checkpoints/850_6.pth
   num_train_epochs: 2
   logging_steps: 250
   # learning_rate: 0.000005
-  learning_rate: 0.000005
+  learning_rate: 0.00005
   # grad_clipping: None
   early_stopping: True
   early_stopping_mode: max

@@ -255,7 +255,7 @@ class CorefHead(nn.Module):
         # self.classifier = nn.Linear(lstm_output_dim, 3)
 
     def forward(self, bert_outputs, offsets):
-        embeddings = self._pronouns_embeddings(bert_outputs, offsets)
+        embeddings = self._retrieve_pronouns_embeddings(bert_outputs, offsets)
 
         x = self.fc(embeddings)
         # x, _ = self.lstm(x)
@@ -264,15 +264,15 @@ class CorefHead(nn.Module):
         output = self.classifier(x)
         return output
     
-    def _pronouns_embeddings(self, bert_embeddings, pronouns_offsets):
-        embeddings_pronouns = []
+    def _retrieve_pronouns_embeddings(self, bert_embeddings, pronouns_offsets):
+        pronouns_embeddings = []
 
         # Consider embeddings and offsets in each batch separately
         for embeddings, offsets in zip(bert_embeddings, pronouns_offsets):
-            embeddings_pronouns.append(embeddings[offsets])
+            pronouns_embeddings.append(embeddings[offsets])
 
         # Merge outputs
-        merged_pronouns_embeddings = torch.stack(embeddings_pronouns, dim=0)
+        merged_pronouns_embeddings = torch.stack(pronouns_embeddings, dim=0)
         
         # shape: batch_size x seq_length x embedding_dim
         return merged_pronouns_embeddings
