@@ -1,9 +1,18 @@
 import re
+import yaml
 
 import numpy as np
+import pandas as pd
 from typing import List, Tuple, Dict
 
 from model import Model
+
+from transformers import AutoTokenizer
+from torch.utils.data import DataLoader
+from stud.coref_model import *
+from stud.arguments import *
+from stud.gap_dataset import *
+from stud.gap_utils import *
 
 
 def build_model_123(device: str) -> Model:
@@ -42,7 +51,7 @@ def build_model_3(device: str) -> Model:
         A Model instance that implements step 3 of the Coreference resolution pipeline.
             3: Coreference resolution
     """
-    return RandomBaseline(False, False)
+    return StudentModel(device)
 
 
 class RandomBaseline(Model):
@@ -103,7 +112,8 @@ class RandomBaseline(Model):
 
     def predict_entity(self, predictions, pron, pron_offset, text, toks, entities=None):
         entities = (
-            entities if entities is not None else self.predict_entities(entities, toks)
+            entities if entities is not None else self.predict_entities(
+                entities, toks)
         )
         entity_idx = np.random.choice([0, len(entities) - 1], 1)[0]
         return entities[entity_idx]
@@ -120,12 +130,69 @@ class RandomBaseline(Model):
 
 class StudentModel(Model):
 
-    # STUDENT: construct here your model
-    # this class should be loading your weights and vocabulary
+    def __init__(self, device):
+
+        self.device = device
+        self.tag_labels = {
+            "pronoun_tag": "<p>",
+            "start_A_tag": "<a>",
+            "end_A_tag": "</a>",
+            "start_B_tag": "<b>",
+            "end_B_tag": "</b>"
+        }
+        self.model = None
+        self.tokenizer = None
 
     def predict(
         self, sentences: List[Dict]
     ) -> List[Tuple[Tuple[str, int], Tuple[str, int]]]:
-        # STUDENT: implement here your predict function
-        # remember to respect the same order of tokens!
-        pass
+
+        if self.model is None:
+            path = "model/checkpoints/MentionScore/large/large-mention_score_872.pth"
+
+            yaml_file = "model/checkpoints/MentionScore/large/predict.yaml"
+            # Read configuration file with all the necessary parameters
+            with open(yaml_file) as file:
+                config = yaml.safe_load(file)
+
+            model_args = ModelArguments(**config['model_args'])
+            model_name_or_path = model_args.model_name_or_path
+            tokenizer_name_or_path = model_args.tokenizer
+            if tokenizer_name_or_path is None:
+                tokenizer_name_or_path = model_name_or_path
+
+            self.tokenizer = AutoTokenizer.from_pretrained(
+                tokenizer_name_or_path, never_split=list(self.tag_labels.values()))
+            self.tokenizer.add_tokens(
+                list(self.tag_labels.values()), special_tokens=True)
+
+            self.model = CR_Model(self.device, model_name_or_path, self.tokenizer, model_args).to(
+                self.device, non_blocking=True)
+            print("Model Init")
+            self.model.load_state_dict(
+                torch.load(path, map_location=self.device))
+            print("Model Loaded")
+            print("Predicting...")
+
+        df = pd.DataFrame(sentences)
+        dataset = GAP_Dataset(df, self.tokenizer, self.tag_labels,
+                              truncate_up_to_pron=False, labeled=False, cleaned=False)
+        collator = Collator(self.device, labeled=False)
+
+        predictions = []
+
+        self.model.eval()
+        with torch.no_grad():
+            dataloader = DataLoader(dataset, batch_size=1,
+                                    collate_fn=collator, shuffle=False)
+
+            for sample, sentence in zip(dataloader, sentences):
+                predicted_label_id = self.model(sample).argmax(1).item()
+                pred_entity, pred_entity_offset = get_entity_and_offset_from_id(
+                    predicted_label_id, sentence)
+                pron, pron_offset = sentence['pron'], sentence['p_offset']
+
+                predictions.append(
+                    ((pron, pron_offset), (pred_entity, pred_entity_offset)))
+
+        return predictions

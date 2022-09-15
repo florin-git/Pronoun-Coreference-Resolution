@@ -1,24 +1,22 @@
 model_args:
-  model_name_or_path: bert-base-cased
+  model_name_or_path: bert-large-uncased
   resize_embeddings: False
   # bert_hidden_size: 768
   head_hidden_size: 512
   linear_hidden_size: 256
   dropout: 0.1
-  # output_strategy: sum
-
+#  output_strategy: sum
 
 training_args:
   output_dir: ../../model/checkpoints/
-  save_model: False
+  save_model: True
   task_type: 3
 
-  num_train_epochs: 2
+  num_train_epochs: 3
   logging_steps: 250
   # learning_rate: 0.000005
   learning_rate: 0.000008
-  # grad_clipping: 5
+  # grad_clipping: 0.6
   use_early_stopping: True
   early_stopping_mode: max
   early_stopping_patience: 2
-  # use_scaler: False
